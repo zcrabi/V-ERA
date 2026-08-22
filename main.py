@@ -10,14 +10,16 @@ Sonra tarayıcıda: http://localhost:8000
 """
 
 import io
+import base64
 import hashlib
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from PIL import Image
+from PIL import Image, ImageChops, ImageEnhance
 from PIL.ExifTags import TAGS, GPSTAGS
 
 app = FastAPI(title="Görsel Sahtecilik Tespit Sistemi")
@@ -106,6 +108,81 @@ def analyze_metadata(exif_data: dict) -> dict:
     }
 
 
+def compute_ela(image: Image.Image, quality: int = 90, scale: int = 15) -> tuple[Image.Image, dict]:
+    """
+    Error Level Analysis: görseli belirli bir JPEG kalitesinde yeniden
+    kaydedip orijinaliyle arasındaki farkı hesaplar. Dokunulmamış bölgeler
+    her yerde benzer şekilde bozulur; sonradan eklenmiş/kopyalanmış
+    bölgeler farklı sıkıştırma geçmişine sahip olduğundan öne çıkar.
+    """
+    rgb_image = image.convert("RGB")
+
+    buffer = io.BytesIO()
+    rgb_image.save(buffer, "JPEG", quality=quality)
+    buffer.seek(0)
+    resaved = Image.open(buffer)
+
+    diff = ImageChops.difference(rgb_image, resaved)
+
+    # Farkı göz ile görülebilir hale getirmek için parlaklığı artırıyoruz.
+    extrema = diff.getextrema()
+    max_diff = max(channel_max for _, channel_max in extrema) or 1
+    enhance_factor = min(scale, 255 / max_diff) if max_diff > 0 else scale
+    ela_image = ImageEnhance.Brightness(diff).enhance(enhance_factor)
+
+    # --- Skor hesaplama: YEREL anormallikleri arıyoruz ---
+    # ELA'nın asıl değeri, görüntünün genelinden çok farklı davranan
+    # KÜÇÜK BÖLGELERİ yakalamakta. Bu yüzden görüntüyü bloklara bölüp
+    # her bloğun ortalama farkına bakıyoruz; ortalamadan aşırı sapan
+    # bloklar "nokta atışı" bir manipülasyona işaret edebilir.
+    gray_diff = np.asarray(diff.convert("L"), dtype=np.float32)
+
+    block_size = max(8, min(gray_diff.shape) // 25)
+    h, w = gray_diff.shape
+    h_trim = (h // block_size) * block_size
+    w_trim = (w // block_size) * block_size
+    trimmed = gray_diff[:h_trim, :w_trim]
+
+    blocks = trimmed.reshape(
+        h_trim // block_size, block_size, w_trim // block_size, block_size
+    )
+    block_means = blocks.mean(axis=(1, 3))
+
+    overall_mean = float(block_means.mean())
+    # Standart sapmayı taban bir değerin altına düşürmüyoruz — aksi halde
+    # zaten çok temiz/düz bir görüntüde (fark ~0'a yakın) en ufak bir
+    # dalgalanma bile "aşırı sapma" gibi görünüp yanlış alarm üretiyor.
+    overall_std = max(float(block_means.std()), 1.5)
+    max_block_mean = float(block_means.max())
+
+    # Bir bloğun "aşırı uç" (outlier) sayılması için HEM istatistiksel
+    # olarak ortalamadan belirgin şekilde sapması HEM DE mutlak olarak
+    # görülebilir bir fark taşıması gerekiyor (ör. 0.1 ile 0.3 arasındaki
+    # anlamsız gürültü farkları z-score'da şişse bile filtrelenir).
+    z_scores = (block_means - overall_mean) / overall_std
+    is_outlier = (z_scores > 3.0) & (block_means > 6.0)
+    outlier_ratio = float(is_outlier.mean())
+
+    spike_signal = min(max(0.0, (max_block_mean - overall_mean - 6.0) / (overall_std * 5)), 1.0)
+    ela_score = int(max(0, min(1, spike_signal * 0.6 + outlier_ratio * 20 * 0.4)) * 100)
+
+    mean_diff_val = float(gray_diff.mean())
+
+    stats = {
+        "mean_difference": round(mean_diff_val, 2),
+        "high_difference_ratio": round(outlier_ratio * 100, 2),
+        "ela_score": ela_score,
+    }
+
+    return ela_image, stats
+
+
+def image_to_base64(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -131,6 +208,14 @@ async def analyze_image(file: UploadFile = File(...)):
     exif_data = extract_exif(image)
     metadata_analysis = analyze_metadata(exif_data)
 
+    ela_image, ela_stats = compute_ela(image)
+    ela_image_b64 = image_to_base64(ela_image)
+
+    # Genel şüphe skoru: metadata + ELA sinyallerinin ağırlıklı ortalaması.
+    overall_score = round(
+        metadata_analysis["suspicion_score"] * 0.4 + ela_stats["ela_score"] * 0.6
+    )
+
     result = {
         "filename": file.filename,
         "file_hash": file_hash,
@@ -142,6 +227,11 @@ async def analyze_image(file: UploadFile = File(...)):
         },
         "exif": exif_data,
         "metadata_analysis": metadata_analysis,
+        "ela_analysis": {
+            **ela_stats,
+            "image_base64": ela_image_b64,
+        },
+        "overall_suspicion_score": overall_score,
     }
 
     return JSONResponse(content=jsonable(result))
@@ -252,6 +342,9 @@ HTML_PAGE = """<!DOCTYPE html>
   .score-num { font-size: 2.4rem; font-weight: 800; line-height: 1; }
   .score-label { color: var(--muted); font-size: 0.8rem; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
 
+  .ela-desc { color: var(--muted); font-size: 0.82rem; margin: 0 0 10px; }
+  .ela-img { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; margin-bottom: 10px; }
+
   .section {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -308,12 +401,19 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="report" id="report">
     <div class="score-card">
       <div class="score-num" id="scoreNum">0</div>
-      <div class="score-label">Şüphe Skoru / 100</div>
+      <div class="score-label">Genel Şüphe Skoru / 100</div>
     </div>
 
     <div class="section">
       <h3>Bulgular</h3>
       <div id="flagsList"></div>
+    </div>
+
+    <div class="section">
+      <h3>ELA — Yeniden Sıkıştırma Analizi</h3>
+      <p class="ela-desc">Parlak/farklı görünen bölgeler, fotoğrafın geri kalanından farklı bir düzenleme geçmişine sahip olabilir.</p>
+      <img id="elaImage" class="ela-img" alt="ELA görseli">
+      <div id="elaStats"></div>
     </div>
 
     <div class="section">
@@ -390,27 +490,47 @@ analyzeBtn.addEventListener("click", async () => {
 
 function renderReport(data) {
   const analysis = data.metadata_analysis;
+  const ela = data.ela_analysis;
+  const overallScore = data.overall_suspicion_score;
 
-  document.getElementById("scoreNum").textContent = analysis.suspicion_score;
+  document.getElementById("scoreNum").textContent = overallScore;
   document.getElementById("scoreNum").style.color =
-    analysis.suspicion_score >= 50 ? "#e5484d" :
-    analysis.suspicion_score >= 20 ? "#ff6b35" : "#3ecf8e";
+    overallScore >= 50 ? "#e5484d" :
+    overallScore >= 20 ? "#ff6b35" : "#3ecf8e";
 
   const flagsList = document.getElementById("flagsList");
   flagsList.innerHTML = "";
-  if (analysis.flags.length === 0) {
+  const allFlags = [...analysis.flags];
+  if (ela.ela_score >= 40) {
+    allFlags.push(`ELA analizinde yüksek fark oranı tespit edildi (skor: ${ela.ela_score}/100) — görselin bazı bölgeleri farklı bir sıkıştırma geçmişine sahip olabilir.`);
+  }
+  if (allFlags.length === 0) {
     const d = document.createElement("div");
     d.className = "flag clean";
-    d.textContent = "Metadata'da belirgin bir şüphe işareti bulunamadı.";
+    d.textContent = "Belirgin bir şüphe işareti bulunamadı.";
     flagsList.appendChild(d);
   } else {
-    analysis.flags.forEach(f => {
+    allFlags.forEach(f => {
       const d = document.createElement("div");
       d.className = "flag";
       d.textContent = f;
       flagsList.appendChild(d);
     });
   }
+
+  document.getElementById("elaImage").src = "data:image/png;base64," + ela.image_base64;
+  const elaStats = document.getElementById("elaStats");
+  elaStats.innerHTML = "";
+  [
+    ["ELA skoru", ela.ela_score + " / 100"],
+    ["Ortalama fark", ela.mean_difference],
+    ["Yüksek fark oranı", ela.high_difference_ratio + "%"],
+  ].forEach(([label, val]) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span>${label}</span><span>${val}</span>`;
+    elaStats.appendChild(row);
+  });
 
   const fileInfo = document.getElementById("fileInfo");
   fileInfo.innerHTML = "";
