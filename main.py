@@ -494,12 +494,56 @@ async def analyze_image(file: UploadFile = File(...)):
     if geometry_result.get("shadow_warning"):
         geometry_score += 25
 
-    overall_score = round(
-        metadata_analysis["suspicion_score"] * 0.2
-        + ela_stats["ela_score"] * 0.3
-        + copy_move_score * 0.35
-        + geometry_score * 0.15
-    )
+    weights = {
+        "metadata": 0.2,
+        "ela": 0.3,
+        "copy_move": 0.35,
+        "geometry": 0.15,
+    }
+    raw_scores = {
+        "metadata": metadata_analysis["suspicion_score"],
+        "ela": ela_stats["ela_score"],
+        "copy_move": copy_move_score,
+        "geometry": geometry_score,
+    }
+    overall_score = round(sum(raw_scores[k] * weights[k] for k in weights))
+
+    signal_breakdown = [
+        {
+            "label": "Metadata / EXIF",
+            "raw_score": raw_scores["metadata"],
+            "weight_pct": int(weights["metadata"] * 100),
+            "contribution": round(raw_scores["metadata"] * weights["metadata"], 1),
+        },
+        {
+            "label": "ELA (sıkıştırma analizi)",
+            "raw_score": raw_scores["ela"],
+            "weight_pct": int(weights["ela"] * 100),
+            "contribution": round(raw_scores["ela"] * weights["ela"], 1),
+        },
+        {
+            "label": "Copy-Move tespiti",
+            "raw_score": raw_scores["copy_move"],
+            "weight_pct": int(weights["copy_move"] * 100),
+            "contribution": round(raw_scores["copy_move"] * weights["copy_move"], 1),
+        },
+        {
+            "label": "Nesne/geometri tutarlılığı",
+            "raw_score": raw_scores["geometry"],
+            "weight_pct": int(weights["geometry"] * 100),
+            "contribution": round(raw_scores["geometry"] * weights["geometry"], 1),
+        },
+    ]
+
+    if overall_score >= 60:
+        verdict = "Yüksek şüphe"
+        verdict_detail = "Birden fazla güçlü sinyal bir arada bulundu. Bu görselin dikkatle incelenmesini öneririz."
+    elif overall_score >= 30:
+        verdict = "Orta düzey şüphe"
+        verdict_detail = "Bazı dikkat çekici bulgular var, ama tek başına kesin bir manipülasyon kanıtı değil. Bulgular kısmını inceleyin."
+    else:
+        verdict = "Düşük şüphe"
+        verdict_detail = "Belirgin bir manipülasyon sinyali bulunamadı. Bu, görselin kesinlikle orijinal olduğu anlamına gelmez, sadece bu analizlerin bir sorun tespit etmediği anlamına gelir."
 
     result = {
         "filename": file.filename,
@@ -519,6 +563,9 @@ async def analyze_image(file: UploadFile = File(...)):
         "copy_move_analysis": copy_move_result,
         "geometry_analysis": geometry_result,
         "screenshot_check": screenshot_check,
+        "signal_breakdown": signal_breakdown,
+        "verdict": verdict,
+        "verdict_detail": verdict_detail,
         "overall_suspicion_score": overall_score,
     }
 
@@ -629,6 +676,15 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .score-num { font-size: 2.4rem; font-weight: 800; line-height: 1; }
   .score-label { color: var(--muted); font-size: 0.8rem; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .verdict { font-weight: 700; font-size: 1rem; margin-top: 14px; }
+  .verdict-detail { color: var(--muted); font-size: 0.82rem; margin-top: 6px; line-height: 1.4; }
+
+  .signal-row { margin-bottom: 12px; }
+  .signal-row-top { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px; }
+  .signal-row-top .signal-label { color: var(--text); }
+  .signal-row-top .signal-value { color: var(--muted); }
+  .signal-bar-bg { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .signal-bar-fill { height: 100%; border-radius: 3px; background: var(--accent); }
 
   .screenshot-warning {
     display: none;
@@ -712,6 +768,14 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="score-card">
       <div class="score-num" id="scoreNum">0</div>
       <div class="score-label">Genel Şüphe Skoru / 100</div>
+      <div class="verdict" id="verdictText"></div>
+      <div class="verdict-detail" id="verdictDetail"></div>
+    </div>
+
+    <div class="section">
+      <h3>Skor Dökümü</h3>
+      <p class="ela-desc">Genel skor dört farklı sinyalin ağırlıklı ortalamasıdır. Her birinin ne kadar etkili olduğu aşağıda.</p>
+      <div id="signalBreakdown"></div>
     </div>
 
     <div class="section">
@@ -833,9 +897,28 @@ function renderReport(data) {
   }
 
   document.getElementById("scoreNum").textContent = overallScore;
-  document.getElementById("scoreNum").style.color =
-    overallScore >= 50 ? "#e5484d" :
-    overallScore >= 20 ? "#ff6b35" : "#3ecf8e";
+  const scoreColor = overallScore >= 50 ? "#e5484d" : overallScore >= 20 ? "#ff6b35" : "#3ecf8e";
+  document.getElementById("scoreNum").style.color = scoreColor;
+
+  const verdictEl = document.getElementById("verdictText");
+  verdictEl.textContent = data.verdict || "";
+  verdictEl.style.color = scoreColor;
+  document.getElementById("verdictDetail").textContent = data.verdict_detail || "";
+
+  const breakdownEl = document.getElementById("signalBreakdown");
+  breakdownEl.innerHTML = "";
+  (data.signal_breakdown || []).forEach(s => {
+    const row = document.createElement("div");
+    row.className = "signal-row";
+    row.innerHTML = `
+      <div class="signal-row-top">
+        <span class="signal-label">${s.label} <span style="color:var(--muted)">(ağırlık %${s.weight_pct})</span></span>
+        <span class="signal-value">${s.raw_score}/100</span>
+      </div>
+      <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:${s.raw_score}%"></div></div>
+    `;
+    breakdownEl.appendChild(row);
+  });
 
   const flagsList = document.getElementById("flagsList");
   flagsList.innerHTML = "";
