@@ -19,8 +19,9 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from PIL import Image, ImageChops, ImageEnhance, ImageDraw
+from PIL import Image, ImageChops, ImageEnhance, ImageDraw, ImageFilter
 from PIL.ExifTags import TAGS, GPSTAGS
+from scipy import ndimage
 
 app = FastAPI(title="Görsel Sahtecilik Tespit Sistemi")
 
@@ -342,6 +343,117 @@ def detect_copy_move(image: Image.Image, block_size: int = 12, stride: int = 1) 
     }
 
 
+def detect_objects_and_check_geometry(image: Image.Image) -> dict:
+    """
+    Hafif (YOLO gerektirmeyen) nesne sayımı + tutarlılık kontrolü.
+
+    Yaklaşım: Kenar tespiti yapıp, birbirine bitişik kenar bölgelerini
+    "nesne" adayı olarak grupluyoruz (connected components). Sonra:
+    1. Kaç nesne bulundu, boyutları
+    2. Nesne boyutları birbirinden aşırı farklı mı (biri diğerlerinden
+       çok daha büyük/küçükse bu "eklenmiş/farklı kaynaklı" bir nesne
+       olabilir — ya da sadece perspektiften kaynaklanan doğal bir fark
+       olabilir; bu yüzden bunu KESİN bir sinyal değil, dikkat çekici
+       bir gözlem olarak sunuyoruz)
+    3. Her nesnenin hemen altındaki bölgenin ortalama parlaklığına bakıp
+       kaba bir "gölge yönü" tahmini yapıyoruz, nesneler arası
+       tutarsızlık var mı diye bakıyoruz
+
+    NOT: Bu YOLO gibi "bu bir kutu" diyebilen akıllı bir tespit değil,
+    sadece kenar yoğunluğuna dayalı kaba bir bölgeleme. Amaç, bariz
+    tutarsızlıkları yakalamak; kesin bir sayım garantisi vermiyor.
+    """
+    original_size = image.size
+    gray = image.convert("L")
+
+    max_dim = 500
+    scale = min(1.0, max_dim / max(gray.size))
+    if scale < 1.0:
+        gray = gray.resize(
+            (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
+            Image.BILINEAR,
+        )
+
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edge_arr = np.asarray(edges, dtype=np.float32)
+
+    threshold = max(20.0, float(np.percentile(edge_arr, 85)))
+    binary = edge_arr > threshold
+
+    # Kenar parçalarını birbirine yakınsa birleştir (nesnenin dış hattı
+    # kesintili çıkabiliyor, bunu kapatıyoruz).
+    structure = np.ones((3, 3))
+    closed = ndimage.binary_closing(binary, structure=structure, iterations=3)
+    closed = ndimage.binary_fill_holes(closed)
+
+    labeled, num_features = ndimage.label(closed, structure=structure)
+
+    if num_features == 0:
+        return {"object_count": 0, "objects": [], "size_warning": None, "shadow_warning": None}
+
+    h, w = edge_arr.shape
+    min_area = (h * w) * 0.003   # çok küçük gürültü parçalarını ele
+    max_area = (h * w) * 0.5     # görüntünün yarısından büyükse muhtemelen arka plandır, nesne değil
+
+    objects = []
+    slices = ndimage.find_objects(labeled)
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        area = int((labeled[sl] == i).sum())
+        if area < min_area or area > max_area:
+            continue
+        y0, y1 = sl[0].start, sl[0].stop
+        x0, x1 = sl[1].start, sl[1].stop
+        box_w, box_h = x1 - x0, y1 - y0
+        if box_w < 10 or box_h < 10:
+            continue
+        objects.append({"box": (x0, y0, x1, y1), "area": area})
+
+    if not objects:
+        return {"object_count": 0, "objects": [], "size_warning": None, "shadow_warning": None}
+
+    # Boyut tutarlılığı: alanların medyanından aşırı sapan var mı?
+    areas = np.array([o["area"] for o in objects], dtype=np.float32)
+    median_area = float(np.median(areas))
+    size_warning = None
+    outlier_indices = []
+    for idx, a in enumerate(areas):
+        if a > median_area * 3 or a < median_area / 3:
+            outlier_indices.append(idx)
+    if outlier_indices and len(objects) >= 3:
+        size_warning = (
+            f"{len(outlier_indices)} nesnenin boyutu diğerlerinden belirgin şekilde "
+            f"farklı — bu perspektiften kaynaklanabilir ya da farklı bir kaynaktan "
+            f"eklenmiş olabilir, tek başına kesin bir kanıt değildir."
+        )
+
+    # NOT: Gölge yönü tutarlılığı kontrolünü de denedik, ama sentetik
+    # testlerde güvenilir sonuç vermedi (gerçek gölgeler basit test
+    # şekillerinden çok daha karmaşık). Yanlış/yanıltıcı bir sinyal
+    # vermemek için bu özelliği şimdilik çıkardık — ileride daha sağlam
+    # bir yöntemle (örn. ışık kaynağı modelleme) yeniden ele alınabilir.
+    shadow_warning = None
+
+    # Görselleştirme
+    annotated = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(annotated)
+    inv_scale = 1.0 / scale if scale < 1.0 else 1.0
+    line_w = max(2, original_size[0] // 300)
+    for idx, o in enumerate(objects, start=1):
+        x0, y0, x1, y1 = o["box"]
+        box_orig = tuple(int(v * inv_scale) for v in (x0, y0, x1, y1))
+        color = (250, 204, 21) if idx - 1 not in outlier_indices else (239, 68, 68)
+        draw.rectangle(box_orig, outline=color, width=line_w)
+
+    return {
+        "object_count": len(objects),
+        "size_warning": size_warning,
+        "shadow_warning": shadow_warning,
+        "annotated_image_base64": image_to_base64(annotated),
+    }
+
+
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -372,13 +484,21 @@ async def analyze_image(file: UploadFile = File(...)):
 
     screenshot_check = detect_screenshot(image, file.filename, exif_data)
     copy_move_result = detect_copy_move(image)
+    geometry_result = detect_objects_and_check_geometry(image)
 
-    # Genel şüphe skoru: metadata + ELA + copy-move sinyallerinin birleşimi.
+    # Genel şüphe skoru: metadata + ELA + copy-move + geometri sinyalleri.
     copy_move_score = 70 if copy_move_result.get("detected") else 0
+    geometry_score = 0
+    if geometry_result.get("size_warning"):
+        geometry_score += 25
+    if geometry_result.get("shadow_warning"):
+        geometry_score += 25
+
     overall_score = round(
-        metadata_analysis["suspicion_score"] * 0.25
-        + ela_stats["ela_score"] * 0.35
-        + copy_move_score * 0.4
+        metadata_analysis["suspicion_score"] * 0.2
+        + ela_stats["ela_score"] * 0.3
+        + copy_move_score * 0.35
+        + geometry_score * 0.15
     )
 
     result = {
@@ -397,6 +517,7 @@ async def analyze_image(file: UploadFile = File(...)):
             "image_base64": ela_image_b64,
         },
         "copy_move_analysis": copy_move_result,
+        "geometry_analysis": geometry_result,
         "screenshot_check": screenshot_check,
         "overall_suspicion_score": overall_score,
     }
@@ -612,6 +733,13 @@ HTML_PAGE = """<!DOCTYPE html>
       <div id="copyMoveLegend" class="cm-legend"></div>
     </div>
 
+    <div class="section" id="geometrySection" style="display:none;">
+      <h3>Nesne Sayımı ve Tutarlılık</h3>
+      <p class="ela-desc" id="geometryCount"></p>
+      <img id="geometryImage" class="ela-img" alt="Nesne tespiti görseli">
+      <div id="geometryWarnings"></div>
+    </div>
+
     <div class="section">
       <h3>Dosya Bilgisi</h3>
       <div id="fileInfo"></div>
@@ -718,6 +846,10 @@ function renderReport(data) {
   if (data.copy_move_analysis && data.copy_move_analysis.detected) {
     allFlags.push(`Kopyala-yapıştır şüphesi: görselde birbirinin neredeyse birebir aynısı olan iki bölge bulundu (${data.copy_move_analysis.match_count} eşleşen blok).`);
   }
+  if (data.geometry_analysis) {
+    if (data.geometry_analysis.size_warning) allFlags.push(data.geometry_analysis.size_warning);
+    if (data.geometry_analysis.shadow_warning) allFlags.push(data.geometry_analysis.shadow_warning);
+  }
   if (allFlags.length === 0) {
     const d = document.createElement("div");
     d.className = "flag clean";
@@ -758,6 +890,25 @@ function renderReport(data) {
       '<span><span class="cm-dot" style="background:#3b82f6"></span>Hedef</span>';
   } else {
     cmSection.style.display = "none";
+  }
+
+  const geo = data.geometry_analysis;
+  const geoSection = document.getElementById("geometrySection");
+  if (geo && geo.object_count > 0) {
+    geoSection.style.display = "block";
+    document.getElementById("geometryCount").textContent =
+      `${geo.object_count} nesne tespit edildi. Sarı: normal, Kırmızı: boyutu diğerlerinden belirgin farklı.`;
+    document.getElementById("geometryImage").src = "data:image/png;base64," + geo.annotated_image_base64;
+    const warnBox = document.getElementById("geometryWarnings");
+    warnBox.innerHTML = "";
+    [geo.size_warning, geo.shadow_warning].filter(Boolean).forEach(w => {
+      const d = document.createElement("div");
+      d.className = "flag";
+      d.textContent = w;
+      warnBox.appendChild(d);
+    });
+  } else {
+    geoSection.style.display = "none";
   }
 
   const fileInfo = document.getElementById("fileInfo");
