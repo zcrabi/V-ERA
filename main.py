@@ -183,6 +183,50 @@ def image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+# Yaygın telefon ekran çözünürlükleri (genellikle screenshot'lar bu boyutlarda
+# çıkar çünkü tam olarak ekranın piksel boyutuna eşittir).
+COMMON_SCREEN_RESOLUTIONS = {
+    (1080, 1920), (1080, 2340), (1080, 2400), (1080, 2412), (1080, 2280),
+    (828, 1792), (750, 1334), (1170, 2532), (1179, 2556), (1284, 2778),
+    (1290, 2796), (1440, 2960), (1440, 3040), (1440, 3120), (1440, 3200),
+    (720, 1280), (1200, 2000), (1200, 2670), (1080, 2160), (1242, 2688),
+    (1125, 2436), (1284, 2778), (1600, 2560), (1350, 2400),
+}
+
+
+def detect_screenshot(image: Image.Image, filename: str, exif_data: dict) -> dict:
+    """
+    Ekran görüntüsü olma ihtimalini kaba ipuçlarıyla tahmin eder.
+    Kesin bir tespit değil, sadece ELA/metadata güvenilirliğini
+    yorumlarken kullanıcıyı uyarmak için bir sinyal.
+    """
+    reasons = []
+
+    name_lower = (filename or "").lower()
+    if any(k in name_lower for k in ["screenshot", "ekran", "ekrangörüntüsü", "screen_shot", "screen shot"]):
+        reasons.append("Dosya adı ekran görüntüsüne işaret ediyor.")
+
+    w, h = image.size
+    normalized = (w, h) if w <= h else (h, w)
+    is_common_res = normalized in {
+        (min(a, b), max(a, b)) for a, b in COMMON_SCREEN_RESOLUTIONS
+    }
+    if is_common_res and not exif_data:
+        reasons.append("Görsel boyutu yaygın bir telefon ekran çözünürlüğüyle eşleşiyor ve EXIF verisi yok.")
+
+    if image.format == "PNG" and not exif_data:
+        reasons.append("PNG formatında ve EXIF verisi yok — kameralar genelde JPEG üretir, PNG genellikle ekran görüntüsü/düzenleme çıktısıdır.")
+
+    is_likely_screenshot = len(reasons) >= 1
+    confidence = "yüksek" if len(reasons) >= 2 else "düşük"
+
+    return {
+        "is_likely_screenshot": is_likely_screenshot,
+        "confidence": confidence if is_likely_screenshot else None,
+        "reasons": reasons,
+    }
+
+
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -211,6 +255,8 @@ async def analyze_image(file: UploadFile = File(...)):
     ela_image, ela_stats = compute_ela(image)
     ela_image_b64 = image_to_base64(ela_image)
 
+    screenshot_check = detect_screenshot(image, file.filename, exif_data)
+
     # Genel şüphe skoru: metadata + ELA sinyallerinin ağırlıklı ortalaması.
     overall_score = round(
         metadata_analysis["suspicion_score"] * 0.4 + ela_stats["ela_score"] * 0.6
@@ -231,6 +277,7 @@ async def analyze_image(file: UploadFile = File(...)):
             **ela_stats,
             "image_base64": ela_image_b64,
         },
+        "screenshot_check": screenshot_check,
         "overall_suspicion_score": overall_score,
     }
 
@@ -342,6 +389,18 @@ HTML_PAGE = """<!DOCTYPE html>
   .score-num { font-size: 2.4rem; font-weight: 800; line-height: 1; }
   .score-label { color: var(--muted); font-size: 0.8rem; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
 
+  .screenshot-warning {
+    display: none;
+    background: #4a2a0022;
+    border: 1px solid #ff6b3555;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    font-size: 0.85rem;
+  }
+  .screenshot-warning strong { color: var(--accent); display: block; margin-bottom: 4px; }
+  .screenshot-warning ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+
   .ela-desc { color: var(--muted); font-size: 0.82rem; margin: 0 0 10px; }
   .ela-img { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; margin-bottom: 10px; }
 
@@ -399,6 +458,12 @@ HTML_PAGE = """<!DOCTYPE html>
   <div id="status">Analiz ediliyor…</div>
 
   <div class="report" id="report">
+    <div class="screenshot-warning" id="screenshotWarning">
+      <strong>⚠️ Bu görsel ekran görüntüsü olabilir</strong>
+      Ekran görüntülerinde orijinal metadata kaybolur ve ELA analizi daha az güvenilir hale gelir. Mümkünse fotoğrafı orijinal dosya olarak yükleyin.
+      <ul id="screenshotReasons"></ul>
+    </div>
+
     <div class="score-card">
       <div class="score-num" id="scoreNum">0</div>
       <div class="score-label">Genel Şüphe Skoru / 100</div>
@@ -492,6 +557,21 @@ function renderReport(data) {
   const analysis = data.metadata_analysis;
   const ela = data.ela_analysis;
   const overallScore = data.overall_suspicion_score;
+  const screenshotCheck = data.screenshot_check;
+
+  const warningBox = document.getElementById("screenshotWarning");
+  if (screenshotCheck && screenshotCheck.is_likely_screenshot) {
+    warningBox.style.display = "block";
+    const reasonsList = document.getElementById("screenshotReasons");
+    reasonsList.innerHTML = "";
+    screenshotCheck.reasons.forEach(r => {
+      const li = document.createElement("li");
+      li.textContent = r;
+      reasonsList.appendChild(li);
+    });
+  } else {
+    warningBox.style.display = "none";
+  }
 
   document.getElementById("scoreNum").textContent = overallScore;
   document.getElementById("scoreNum").style.color =
