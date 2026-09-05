@@ -21,7 +21,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageChops, ImageEnhance, ImageDraw, ImageFilter
 from PIL.ExifTags import TAGS, GPSTAGS
-from scipy import ndimage
 
 app = FastAPI(title="Görsel Sahtecilik Tespit Sistemi")
 
@@ -324,6 +323,23 @@ def detect_copy_move(image: Image.Image, block_size: int = 12, stride: int = 1) 
     src_box = bbox(source_pts)
     tgt_box = bbox(target_pts)
 
+    # --- Yoğunluk kontrolü (asfalt/çim/su gibi tekrarlayan dokularda
+    # yanlış pozitifi engellemek için) ---
+    # Gerçek bir kopyala-yapıştırda, kaynak dikdörtgenin İÇİ neredeyse
+    # tamamen eşleşen bloklarla dolu olur (yoğun/sıkı bir küme). Tekrarlayan
+    # bir doku (asfalt, çim, su vb.) ise, görüntünün geniş bir alanına
+    # YAYILMIŞ, seyrek/dağınık eşleşmeler üretir — eşleşme sayısı yüksek
+    # olsa bile. Bu ikisini ayırt etmek için, bulunan bölgenin alanına göre
+    # eşleşme yoğunluğuna bakıyoruz.
+    src_w = src_box[2] - src_box[0]
+    src_h = src_box[3] - src_box[1]
+    expected_positions = max(1, (src_w * src_h) / (block_size * block_size))
+    density = len(matches) / expected_positions
+
+    MIN_DENSITY = 0.12
+    if density < MIN_DENSITY:
+        return {"detected": False, "reason": None}
+
     inv_scale = 1.0 / scale if scale < 1.0 else 1.0
     src_box_orig = tuple(int(v * inv_scale) for v in src_box)
     tgt_box_orig = tuple(int(v * inv_scale) for v in tgt_box)
@@ -341,6 +357,104 @@ def detect_copy_move(image: Image.Image, block_size: int = 12, stride: int = 1) 
         "target_box": tgt_box_orig,
         "annotated_image_base64": image_to_base64(annotated),
     }
+
+
+def _binary_dilate(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """PIL MaxFilter ile basit ikili genişletme (scipy'siz)."""
+    img = Image.fromarray((mask * 255).astype(np.uint8))
+    for _ in range(iterations):
+        img = img.filter(ImageFilter.MaxFilter(3))
+    return np.asarray(img) > 127
+
+
+def _binary_erode(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """PIL MinFilter ile basit ikili aşındırma (scipy'siz)."""
+    img = Image.fromarray((mask * 255).astype(np.uint8))
+    for _ in range(iterations):
+        img = img.filter(ImageFilter.MinFilter(3))
+    return np.asarray(img) > 127
+
+
+def _fill_holes(mask: np.ndarray) -> np.ndarray:
+    """
+    Kenarlardan (sınırdan) ulaşılamayan arka plan bölgelerini "delik" kabul
+    edip dolduruyoruz. Sınırdan başlayan bir flood-fill ile arka planı
+    işaretliyoruz; işaretlenmeyen arka plan pikselleri deliktir.
+    """
+    h, w = mask.shape
+    background = ~mask
+    reachable = np.zeros_like(background)
+
+    stack = []
+    for x in range(w):
+        if background[0, x]:
+            stack.append((0, x))
+        if background[h - 1, x]:
+            stack.append((h - 1, x))
+    for y in range(h):
+        if background[y, 0]:
+            stack.append((y, 0))
+        if background[y, w - 1]:
+            stack.append((y, w - 1))
+
+    for y, x in stack:
+        reachable[y, x] = True
+
+    while stack:
+        y, x = stack.pop()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and background[ny, nx] and not reachable[ny, nx]:
+                reachable[ny, nx] = True
+                stack.append((ny, nx))
+
+    holes = background & ~reachable
+    return mask | holes
+
+
+def _label_connected_components(mask: np.ndarray) -> tuple:
+    """
+    8-komşuluklu basit bağlı bölge (connected component) etiketleme.
+    Sadece "açık" (True) piksellerde gezindiği için, seyrek maskelerde
+    (bizim durumumuzda kenar haritaları) hızlı çalışır.
+    """
+    h, w = mask.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    visited = np.zeros((h, w), dtype=bool)
+    current_label = 0
+
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if visited[y0, x0]:
+            continue
+        current_label += 1
+        stack = [(y0, x0)]
+        visited[y0, x0] = True
+        while stack:
+            y, x = stack.pop()
+            labels[y, x] = current_label
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+
+    return labels, current_label
+
+
+def _find_object_slices(labels: np.ndarray, num_features: int) -> list:
+    """Her etiket için (y0,y1,x0,x1) sınırlarını bulur."""
+    slices = []
+    for i in range(1, num_features + 1):
+        ys, xs = np.nonzero(labels == i)
+        if len(ys) == 0:
+            slices.append(None)
+            continue
+        slices.append((slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1)))
+    return slices
 
 
 def detect_objects_and_check_geometry(image: Image.Image) -> dict:
@@ -379,14 +493,21 @@ def detect_objects_and_check_geometry(image: Image.Image) -> dict:
 
     threshold = max(20.0, float(np.percentile(edge_arr, 85)))
     binary = edge_arr > threshold
+    # FIND_EDGES filtresi görüntünün en dış çerçevesinde yapay/sahte bir
+    # "kenar" oluşturur (gerçek bir kenar değil, filtrenin sınır etkisi).
+    # Bu, delik doldurma mantığını bozduğu için dış çerçeveyi temizliyoruz.
+    binary[0, :] = False
+    binary[-1, :] = False
+    binary[:, 0] = False
+    binary[:, -1] = False
 
     # Kenar parçalarını birbirine yakınsa birleştir (nesnenin dış hattı
     # kesintili çıkabiliyor, bunu kapatıyoruz).
-    structure = np.ones((3, 3))
-    closed = ndimage.binary_closing(binary, structure=structure, iterations=3)
-    closed = ndimage.binary_fill_holes(closed)
+    closed = _binary_dilate(binary, iterations=3)
+    closed = _binary_erode(closed, iterations=3)
+    closed = _fill_holes(closed)
 
-    labeled, num_features = ndimage.label(closed, structure=structure)
+    labeled, num_features = _label_connected_components(closed)
 
     if num_features == 0:
         return {"object_count": 0, "objects": [], "size_warning": None, "shadow_warning": None}
@@ -396,7 +517,7 @@ def detect_objects_and_check_geometry(image: Image.Image) -> dict:
     max_area = (h * w) * 0.5     # görüntünün yarısından büyükse muhtemelen arka plandır, nesne değil
 
     objects = []
-    slices = ndimage.find_objects(labeled)
+    slices = _find_object_slices(labeled, num_features)
     for i, sl in enumerate(slices, start=1):
         if sl is None:
             continue
@@ -594,48 +715,84 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Görsel Sahtecilik Tespit Sistemi</title>
+<title>V-ERA — Görsel Sahtecilik Tespit Sistemi</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --border: #2a2f3a;
-    --text: #e6e8eb;
-    --muted: #8b93a3;
-    --accent: #ff6b35;
-    --accent-dim: #ff6b3522;
-    --danger: #e5484d;
-    --ok: #3ecf8e;
+    --bg: #0a0c0f;
+    --panel: #12151a;
+    --panel-raised: #171b21;
+    --border: #232830;
+    --text: #eef0f2;
+    --muted: #8a92a0;
+    --amber: #e8a33d;
+    --amber-dim: #e8a33d1a;
+    --cyan: #4dc4d9;
+    --danger: #ef4444;
+    --ok: #22c55e;
+    --source: #ef4444;
+    --target: #3b82f6;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: 'Inter', -apple-system, "Segoe UI", sans-serif;
     background: var(--bg);
+    background-image:
+      radial-gradient(ellipse 600px 300px at 50% -10%, #e8a33d0d, transparent);
     color: var(--text);
-    padding: 24px 16px 60px;
+    padding: 28px 16px 60px;
+    line-height: 1.5;
   }
-  .wrap { max-width: 640px; margin: 0 auto; }
-  h1 {
-    font-size: 1.3rem;
-    font-weight: 700;
-    margin: 0 0 4px;
-    letter-spacing: -0.01em;
-  }
-  .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+  .wrap { max-width: 620px; margin: 0 auto; }
 
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  .brand-mark {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 1.5rem;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+  .brand-mark span { color: var(--amber); }
+  .tagline { color: var(--muted); font-size: 0.88rem; margin-bottom: 28px; }
+
+  /* --- Upload zone: kanıt yükleme alanı, köşe işaretleriyle bir tarayıcı/vizör hissi --- */
   .dropzone {
-    border: 2px dashed var(--border);
-    border-radius: 14px;
-    padding: 36px 20px;
+    position: relative;
+    border: 1.5px dashed var(--border);
+    border-radius: 16px;
+    padding: 44px 20px;
     text-align: center;
     cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease;
+    transition: border-color 0.18s ease, background 0.18s ease;
     background: var(--panel);
   }
-  .dropzone.drag { border-color: var(--accent); background: var(--accent-dim); }
+  .dropzone.drag { border-color: var(--amber); background: var(--amber-dim); }
+  .dropzone::before, .dropzone::after,
+  .corner-tl, .corner-br { display: none; }
+  .scan-corner {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--border);
+    opacity: 0.9;
+    transition: border-color 0.18s ease;
+  }
+  .dropzone.drag .scan-corner { border-color: var(--amber); }
+  .scan-corner.tl { top: 10px; left: 10px; border-right: none; border-bottom: none; border-top-left-radius: 6px; }
+  .scan-corner.tr { top: 10px; right: 10px; border-left: none; border-bottom: none; border-top-right-radius: 6px; }
+  .scan-corner.bl { bottom: 10px; left: 10px; border-right: none; border-top: none; border-bottom-left-radius: 6px; }
+  .scan-corner.br { bottom: 10px; right: 10px; border-left: none; border-top: none; border-bottom-right-radius: 6px; }
   .dropzone p { margin: 8px 0 0; color: var(--muted); font-size: 0.85rem; }
-  .dropzone strong { color: var(--text); font-size: 1rem; }
+  .dropzone strong { color: var(--text); font-size: 1.02rem; font-weight: 600; }
   input[type=file] { display: none; }
 
   #preview { margin-top: 16px; display: none; }
@@ -649,81 +806,113 @@ HTML_PAGE = """<!DOCTYPE html>
   button.analyze {
     width: 100%;
     margin-top: 16px;
-    padding: 14px;
+    padding: 15px;
     border: none;
     border-radius: 10px;
-    background: var(--accent);
-    color: #0f1115;
-    font-weight: 700;
+    background: var(--amber);
+    color: #14110a;
+    font-weight: 600;
+    font-family: 'Space Grotesk', sans-serif;
     font-size: 1rem;
+    letter-spacing: -0.01em;
     cursor: pointer;
-    display: none;
+    transition: transform 0.1s ease, opacity 0.15s ease;
   }
   button.analyze:active { transform: scale(0.98); }
-  button.analyze:disabled { opacity: 0.6; }
+  button.analyze:disabled { opacity: 0.5; }
 
   .report {
-    margin-top: 24px;
+    margin-top: 28px;
     display: none;
   }
+
+  /* --- Skor göstergesi: dairesel gösterge (gauge) --- */
   .score-card {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 20px;
+    border-radius: 18px;
+    padding: 28px 20px;
     text-align: center;
     margin-bottom: 16px;
   }
-  .score-num { font-size: 2.4rem; font-weight: 800; line-height: 1; }
-  .score-label { color: var(--muted); font-size: 0.8rem; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .verdict { font-weight: 700; font-size: 1rem; margin-top: 14px; }
-  .verdict-detail { color: var(--muted); font-size: 0.82rem; margin-top: 6px; line-height: 1.4; }
+  .gauge-wrap { position: relative; width: 148px; height: 148px; margin: 0 auto; }
+  .gauge-wrap svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .gauge-track { fill: none; stroke: var(--border); stroke-width: 10; }
+  .gauge-fill {
+    fill: none;
+    stroke-width: 10;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.8s cubic-bezier(0.16, 1, 0.3, 1), stroke 0.3s ease;
+  }
+  .gauge-center {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .score-num { font-family: 'Space Grotesk', sans-serif; font-size: 2.6rem; font-weight: 700; line-height: 1; }
+  .score-label { color: var(--muted); font-size: 0.72rem; margin-top: 2px; }
+  .verdict { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 1.1rem; margin-top: 18px; }
+  .verdict-detail { color: var(--muted); font-size: 0.85rem; margin-top: 6px; line-height: 1.5; max-width: 440px; margin-left: auto; margin-right: auto; }
 
-  .signal-row { margin-bottom: 12px; }
-  .signal-row-top { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px; }
-  .signal-row-top .signal-label { color: var(--text); }
-  .signal-row-top .signal-value { color: var(--muted); }
-  .signal-bar-bg { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
-  .signal-bar-fill { height: 100%; border-radius: 3px; background: var(--accent); }
+  .signal-row { margin-bottom: 14px; }
+  .signal-row:last-child { margin-bottom: 0; }
+  .signal-row-top { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.85rem; margin-bottom: 5px; }
+  .signal-row-top .signal-label { color: var(--text); font-weight: 500; }
+  .signal-row-top .signal-weight { color: var(--muted); font-size: 0.78rem; }
+  .signal-row-top .signal-value { color: var(--muted); font-family: 'Space Grotesk', sans-serif; font-size: 0.85rem; }
+  .signal-bar-bg { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .signal-bar-fill { height: 100%; border-radius: 3px; background: var(--amber); }
 
   .screenshot-warning {
     display: none;
-    background: #4a2a0022;
-    border: 1px solid #ff6b3555;
-    border-radius: 12px;
+    background: #e8a33d14;
+    border: 1px solid #e8a33d40;
+    border-left: 3px solid var(--amber);
+    border-radius: 10px;
     padding: 14px 16px;
     margin-bottom: 16px;
     font-size: 0.85rem;
   }
-  .screenshot-warning strong { color: var(--accent); display: block; margin-bottom: 4px; }
+  .screenshot-warning strong { color: var(--amber); display: block; margin-bottom: 4px; font-weight: 600; }
   .screenshot-warning ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
 
-  .ela-desc { color: var(--muted); font-size: 0.82rem; margin: 0 0 10px; }
-  .ela-img { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; margin-bottom: 10px; }
+  .section-desc { color: var(--muted); font-size: 0.85rem; margin: 0 0 12px; }
+  .section-img { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; margin-bottom: 10px; }
 
-  .cm-legend { display: flex; gap: 16px; font-size: 0.82rem; color: var(--muted); }
+  .cm-legend { display: flex; gap: 18px; font-size: 0.82rem; color: var(--muted); }
   .cm-legend span { display: flex; align-items: center; gap: 6px; }
-  .cm-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .cm-dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 
+  /* --- Bölümler: kategoriye göre renkli sol şerit, küçük harf başlıklar --- */
   .section {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 16px 18px;
+    border-left: 3px solid var(--cat-color, var(--border));
+    border-radius: 4px 14px 14px 4px;
+    padding: 18px 20px;
     margin-bottom: 12px;
   }
+  .section.cat-meta { --cat-color: #6b7280; }
+  .section.cat-score { --cat-color: var(--amber); }
+  .section.cat-ela { --cat-color: var(--cyan); }
+  .section.cat-copymove { --cat-color: #f472b6; }
+  .section.cat-geometry { --cat-color: #a78bfa; }
+
   .section h3 {
-    margin: 0 0 10px;
-    font-size: 0.85rem;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    margin: 0 0 12px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text);
+    font-family: 'Space Grotesk', sans-serif;
   }
   .row {
     display: flex;
     justify-content: space-between;
-    padding: 6px 0;
-    font-size: 0.9rem;
+    padding: 7px 0;
+    font-size: 0.88rem;
     border-bottom: 1px solid var(--border);
   }
   .row:last-child { border-bottom: none; }
@@ -731,81 +920,97 @@ HTML_PAGE = """<!DOCTYPE html>
 
   .flag {
     display: flex;
-    gap: 8px;
-    padding: 8px 0;
+    gap: 9px;
+    padding: 9px 0;
     font-size: 0.87rem;
     align-items: flex-start;
+    border-bottom: 1px solid var(--border);
   }
-  .flag::before { content: "⚠️"; flex-shrink: 0; }
-  .flag.clean::before { content: "✅"; }
-  .flag.clean { color: var(--ok); }
+  .flag:last-child { border-bottom: none; }
+  .flag::before { content: "●"; color: var(--amber); flex-shrink: 0; font-size: 0.6rem; margin-top: 6px; }
+  .flag.clean::before { content: "●"; color: var(--ok); }
 
-  #status { text-align: center; color: var(--muted); font-size: 0.85rem; margin-top: 10px; display: none; }
+  #status { text-align: center; color: var(--muted); font-size: 0.85rem; margin-top: 12px; display: none; }
+  #status::before { content: "◌ "; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🔍 Görsel Sahtecilik Tespit Sistemi</h1>
-  <div class="subtitle">Faz 1 — Metadata / EXIF analizi</div>
+  <div class="brand">
+    <div class="brand-mark">V-<span>ERA</span></div>
+  </div>
+  <div class="tagline">Görüntünün ötesine bakar: izleri inceler, manipülasyonları tespit eder.</div>
 
   <div class="dropzone" id="dropzone">
+    <span class="scan-corner tl"></span>
+    <span class="scan-corner tr"></span>
+    <span class="scan-corner bl"></span>
+    <span class="scan-corner br"></span>
     <strong>Fotoğraf seç ya da sürükle</strong>
     <p>JPG, PNG desteklenir</p>
     <input type="file" id="fileInput" accept="image/*">
   </div>
 
   <div id="preview"><img id="previewImg" alt="önizleme"></div>
-  <button class="analyze" id="analyzeBtn">Analiz Et</button>
-  <div id="status">Analiz ediliyor…</div>
+  <button class="analyze" id="analyzeBtn" style="display:none;">Analiz et</button>
+  <div id="status">Analiz ediliyor</div>
 
   <div class="report" id="report">
     <div class="screenshot-warning" id="screenshotWarning">
-      <strong>⚠️ Bu görsel ekran görüntüsü olabilir</strong>
+      <strong>Bu görsel ekran görüntüsü olabilir</strong>
       Ekran görüntülerinde orijinal metadata kaybolur ve ELA analizi daha az güvenilir hale gelir. Mümkünse fotoğrafı orijinal dosya olarak yükleyin.
       <ul id="screenshotReasons"></ul>
     </div>
 
     <div class="score-card">
-      <div class="score-num" id="scoreNum">0</div>
-      <div class="score-label">Genel Şüphe Skoru / 100</div>
+      <div class="gauge-wrap">
+        <svg viewBox="0 0 120 120">
+          <circle class="gauge-track" cx="60" cy="60" r="52"></circle>
+          <circle class="gauge-fill" id="gaugeFill" cx="60" cy="60" r="52"></circle>
+        </svg>
+        <div class="gauge-center">
+          <div class="score-num" id="scoreNum">0</div>
+          <div class="score-label">/ 100</div>
+        </div>
+      </div>
       <div class="verdict" id="verdictText"></div>
       <div class="verdict-detail" id="verdictDetail"></div>
     </div>
 
-    <div class="section">
-      <h3>Skor Dökümü</h3>
-      <p class="ela-desc">Genel skor dört farklı sinyalin ağırlıklı ortalamasıdır. Her birinin ne kadar etkili olduğu aşağıda.</p>
+    <div class="section cat-score">
+      <h3>Skor dökümü</h3>
+      <p class="section-desc">Genel skor dört farklı sinyalin ağırlıklı ortalamasıdır. Her birinin ne kadar etkili olduğu aşağıda.</p>
       <div id="signalBreakdown"></div>
     </div>
 
-    <div class="section">
+    <div class="section cat-meta">
       <h3>Bulgular</h3>
       <div id="flagsList"></div>
     </div>
 
-    <div class="section">
-      <h3>ELA — Yeniden Sıkıştırma Analizi</h3>
-      <p class="ela-desc">Parlak/farklı görünen bölgeler, fotoğrafın geri kalanından farklı bir düzenleme geçmişine sahip olabilir.</p>
-      <img id="elaImage" class="ela-img" alt="ELA görseli">
+    <div class="section cat-ela">
+      <h3>ELA — yeniden sıkıştırma analizi</h3>
+      <p class="section-desc">Parlak/farklı görünen bölgeler, fotoğrafın geri kalanından farklı bir düzenleme geçmişine sahip olabilir.</p>
+      <img id="elaImage" class="section-img" alt="ELA görseli">
       <div id="elaStats"></div>
     </div>
 
-    <div class="section" id="copyMoveSection" style="display:none;">
-      <h3>Copy-Move Tespiti</h3>
-      <p class="ela-desc" id="copyMoveDesc"></p>
-      <img id="copyMoveImage" class="ela-img" alt="Copy-move görseli">
+    <div class="section cat-copymove" id="copyMoveSection" style="display:none;">
+      <h3>Copy-move tespiti</h3>
+      <p class="section-desc" id="copyMoveDesc"></p>
+      <img id="copyMoveImage" class="section-img" alt="Copy-move görseli">
       <div id="copyMoveLegend" class="cm-legend"></div>
     </div>
 
-    <div class="section" id="geometrySection" style="display:none;">
-      <h3>Nesne Sayımı ve Tutarlılık</h3>
-      <p class="ela-desc" id="geometryCount"></p>
-      <img id="geometryImage" class="ela-img" alt="Nesne tespiti görseli">
+    <div class="section cat-geometry" id="geometrySection" style="display:none;">
+      <h3>Nesne sayımı ve tutarlılık</h3>
+      <p class="section-desc" id="geometryCount"></p>
+      <img id="geometryImage" class="section-img" alt="Nesne tespiti görseli">
       <div id="geometryWarnings"></div>
     </div>
 
-    <div class="section">
-      <h3>Dosya Bilgisi</h3>
+    <div class="section cat-meta">
+      <h3>Dosya bilgisi</h3>
       <div id="fileInfo"></div>
     </div>
   </div>
@@ -813,6 +1018,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 const API_URL = window.location.origin + "/analyze";
+const GAUGE_CIRCUMFERENCE = 2 * Math.PI * 52;
 
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
@@ -821,6 +1027,10 @@ const previewImg = document.getElementById("previewImg");
 const analyzeBtn = document.getElementById("analyzeBtn");
 const statusEl = document.getElementById("status");
 const report = document.getElementById("report");
+
+const gaugeFill = document.getElementById("gaugeFill");
+gaugeFill.style.strokeDasharray = `${GAUGE_CIRCUMFERENCE}`;
+gaugeFill.style.strokeDashoffset = `${GAUGE_CIRCUMFERENCE}`;
 
 let selectedFile = null;
 
@@ -896,9 +1106,16 @@ function renderReport(data) {
     warningBox.style.display = "none";
   }
 
+  const scoreColor = overallScore >= 60 ? "#ef4444" : overallScore >= 30 ? "#e8a33d" : "#22c55e";
   document.getElementById("scoreNum").textContent = overallScore;
-  const scoreColor = overallScore >= 50 ? "#e5484d" : overallScore >= 20 ? "#ff6b35" : "#3ecf8e";
   document.getElementById("scoreNum").style.color = scoreColor;
+
+  const offset = GAUGE_CIRCUMFERENCE * (1 - overallScore / 100);
+  gaugeFill.style.stroke = scoreColor;
+  // Bir sonraki karede uygula ki geçiş animasyonu tetiklensin.
+  requestAnimationFrame(() => {
+    gaugeFill.style.strokeDashoffset = `${offset}`;
+  });
 
   const verdictEl = document.getElementById("verdictText");
   verdictEl.textContent = data.verdict || "";
@@ -912,7 +1129,7 @@ function renderReport(data) {
     row.className = "signal-row";
     row.innerHTML = `
       <div class="signal-row-top">
-        <span class="signal-label">${s.label} <span style="color:var(--muted)">(ağırlık %${s.weight_pct})</span></span>
+        <span class="signal-label">${s.label} <span class="signal-weight">(ağırlık %${s.weight_pct})</span></span>
         <span class="signal-value">${s.raw_score}/100</span>
       </div>
       <div class="signal-bar-bg"><div class="signal-bar-fill" style="width:${s.raw_score}%"></div></div>
@@ -966,7 +1183,7 @@ function renderReport(data) {
   if (cm && cm.detected) {
     cmSection.style.display = "block";
     document.getElementById("copyMoveDesc").textContent =
-      `Kopyalanmış olabilecek bir bölge tespit edildi (${cm.match_count} eşleşen blok). Kırmızı: kaynak bölge, Mavi: hedef (yapıştırılan) bölge.`;
+      `Kopyalanmış olabilecek bir bölge tespit edildi (${cm.match_count} eşleşen blok). Kırmızı: kaynak bölge, mavi: hedef (yapıştırılan) bölge.`;
     document.getElementById("copyMoveImage").src = "data:image/png;base64," + cm.annotated_image_base64;
     document.getElementById("copyMoveLegend").innerHTML =
       '<span><span class="cm-dot" style="background:#ef4444"></span>Kaynak</span>' +
@@ -980,7 +1197,7 @@ function renderReport(data) {
   if (geo && geo.object_count > 0) {
     geoSection.style.display = "block";
     document.getElementById("geometryCount").textContent =
-      `${geo.object_count} nesne tespit edildi. Sarı: normal, Kırmızı: boyutu diğerlerinden belirgin farklı.`;
+      `${geo.object_count} nesne tespit edildi. Sarı: normal, kırmızı: boyutu diğerlerinden belirgin farklı.`;
     document.getElementById("geometryImage").src = "data:image/png;base64," + geo.annotated_image_base64;
     const warnBox = document.getElementById("geometryWarnings");
     warnBox.innerHTML = "";
