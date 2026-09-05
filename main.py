@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageChops, ImageEnhance, ImageDraw, ImageFilter
 from PIL.ExifTags import TAGS, GPSTAGS
+from scipy import ndimage
 
 app = FastAPI(title="Görsel Sahtecilik Tespit Sistemi")
 
@@ -117,6 +118,15 @@ def compute_ela(image: Image.Image, quality: int = 90, scale: int = 15) -> tuple
     """
     rgb_image = image.convert("RGB")
 
+    # Büyük orijinal fotoğraflarda (ör. 4000x3000) JPEG yeniden kaydetme +
+    # piksel farkı hesaplama gereksiz yere yavaşlıyor; analiz için makul
+    # bir üst sınır yeterli ve sonucu pratikte değiştirmiyor.
+    max_dim = 1200
+    if max(rgb_image.size) > max_dim:
+        ratio = max_dim / max(rgb_image.size)
+        new_size = (max(1, int(rgb_image.width * ratio)), max(1, int(rgb_image.height * ratio)))
+        rgb_image = rgb_image.resize(new_size, Image.BILINEAR)
+
     buffer = io.BytesIO()
     rgb_image.save(buffer, "JPEG", quality=quality)
     buffer.seek(0)
@@ -177,10 +187,40 @@ def compute_ela(image: Image.Image, quality: int = 90, scale: int = 15) -> tuple
     return ela_image, stats
 
 
-def image_to_base64(image: Image.Image) -> str:
+def image_to_base64(image: Image.Image, max_dim: int = 900) -> str:
+    """
+    Görseli base64 PNG'ye çevirir. Görüntüleme amaçlı olduğu için, büyük
+    orijinal fotoğrafları (ör. 4000x3000) olduğu gibi kodlamak hem PNG
+    sıkıştırmasını çok yavaşlatır hem de mobilde çok büyük bir veri
+    indirmesine yol açar — bu yüzden önce makul bir boyuta küçültüyoruz.
+    Analiz sonuçları zaten küçültülmüş görseller üzerinden hesaplandığı
+    için, bu sadece görüntüleme kalitesini etkiler, doğruluğu değil.
+    """
+    if max(image.size) > max_dim:
+        ratio = max_dim / max(image.size)
+        new_size = (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
+        image = image.resize(new_size, Image.BILINEAR)
     buffer = io.BytesIO()
-    image.save(buffer, "PNG")
+    image.save(buffer, "PNG", optimize=False, compress_level=4)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _prepare_display_copy(image: Image.Image, max_dim: int = 900) -> tuple:
+    """
+    İşaretleme (kutu çizme) için orijinal görselin KÜÇÜLTÜLMÜŞ bir
+    kopyasını hazırlar. Büyük orijinal fotoğraflarda (ör. 4000x3000)
+    doğrudan tam boyutta çizim yapıp sonra küçültmek çok yavaş oluyordu;
+    bunun yerine önce küçültüp öyle çiziyoruz. Dönen `scale` değeri,
+    ORİJİNAL görseldeki koordinatları bu küçük kopyadaki koordinatlara
+    çevirmek için çarpılacak katsayıdır.
+    """
+    display = image.convert("RGB")
+    scale = 1.0
+    if max(display.size) > max_dim:
+        scale = max_dim / max(display.size)
+        new_size = (max(1, int(display.width * scale)), max(1, int(display.height * scale)))
+        display = display.resize(new_size, Image.BILINEAR)
+    return display, scale
 
 
 # Yaygın telefon ekran çözünürlükleri (genellikle screenshot'lar bu boyutlarda
@@ -344,117 +384,24 @@ def detect_copy_move(image: Image.Image, block_size: int = 12, stride: int = 1) 
     src_box_orig = tuple(int(v * inv_scale) for v in src_box)
     tgt_box_orig = tuple(int(v * inv_scale) for v in tgt_box)
 
-    annotated = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(annotated)
-    line_w = max(3, original_size[0] // 200)
-    draw.rectangle(src_box_orig, outline=(239, 68, 68), width=line_w)
-    draw.rectangle(tgt_box_orig, outline=(59, 130, 246), width=line_w)
+    # Çizimi orijinal boyutta değil, küçük bir "gösterim kopyası" üzerinde
+    # yapıyoruz (büyük fotoğraflarda ciddi hız kazandırıyor).
+    display, display_scale = _prepare_display_copy(image)
+    src_box_display = tuple(int(v * display_scale) for v in src_box_orig)
+    tgt_box_display = tuple(int(v * display_scale) for v in tgt_box_orig)
+
+    draw = ImageDraw.Draw(display)
+    line_w = max(2, display.size[0] // 200)
+    draw.rectangle(src_box_display, outline=(239, 68, 68), width=line_w)
+    draw.rectangle(tgt_box_display, outline=(59, 130, 246), width=line_w)
 
     return {
         "detected": True,
         "match_count": len(matches),
         "source_box": src_box_orig,
         "target_box": tgt_box_orig,
-        "annotated_image_base64": image_to_base64(annotated),
+        "annotated_image_base64": image_to_base64(display),
     }
-
-
-def _binary_dilate(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
-    """PIL MaxFilter ile basit ikili genişletme (scipy'siz)."""
-    img = Image.fromarray((mask * 255).astype(np.uint8))
-    for _ in range(iterations):
-        img = img.filter(ImageFilter.MaxFilter(3))
-    return np.asarray(img) > 127
-
-
-def _binary_erode(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
-    """PIL MinFilter ile basit ikili aşındırma (scipy'siz)."""
-    img = Image.fromarray((mask * 255).astype(np.uint8))
-    for _ in range(iterations):
-        img = img.filter(ImageFilter.MinFilter(3))
-    return np.asarray(img) > 127
-
-
-def _fill_holes(mask: np.ndarray) -> np.ndarray:
-    """
-    Kenarlardan (sınırdan) ulaşılamayan arka plan bölgelerini "delik" kabul
-    edip dolduruyoruz. Sınırdan başlayan bir flood-fill ile arka planı
-    işaretliyoruz; işaretlenmeyen arka plan pikselleri deliktir.
-    """
-    h, w = mask.shape
-    background = ~mask
-    reachable = np.zeros_like(background)
-
-    stack = []
-    for x in range(w):
-        if background[0, x]:
-            stack.append((0, x))
-        if background[h - 1, x]:
-            stack.append((h - 1, x))
-    for y in range(h):
-        if background[y, 0]:
-            stack.append((y, 0))
-        if background[y, w - 1]:
-            stack.append((y, w - 1))
-
-    for y, x in stack:
-        reachable[y, x] = True
-
-    while stack:
-        y, x = stack.pop()
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w and background[ny, nx] and not reachable[ny, nx]:
-                reachable[ny, nx] = True
-                stack.append((ny, nx))
-
-    holes = background & ~reachable
-    return mask | holes
-
-
-def _label_connected_components(mask: np.ndarray) -> tuple:
-    """
-    8-komşuluklu basit bağlı bölge (connected component) etiketleme.
-    Sadece "açık" (True) piksellerde gezindiği için, seyrek maskelerde
-    (bizim durumumuzda kenar haritaları) hızlı çalışır.
-    """
-    h, w = mask.shape
-    labels = np.zeros((h, w), dtype=np.int32)
-    visited = np.zeros((h, w), dtype=bool)
-    current_label = 0
-
-    ys, xs = np.nonzero(mask)
-    for y0, x0 in zip(ys.tolist(), xs.tolist()):
-        if visited[y0, x0]:
-            continue
-        current_label += 1
-        stack = [(y0, x0)]
-        visited[y0, x0] = True
-        while stack:
-            y, x = stack.pop()
-            labels[y, x] = current_label
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-
-    return labels, current_label
-
-
-def _find_object_slices(labels: np.ndarray, num_features: int) -> list:
-    """Her etiket için (y0,y1,x0,x1) sınırlarını bulur."""
-    slices = []
-    for i in range(1, num_features + 1):
-        ys, xs = np.nonzero(labels == i)
-        if len(ys) == 0:
-            slices.append(None)
-            continue
-        slices.append((slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1)))
-    return slices
 
 
 def detect_objects_and_check_geometry(image: Image.Image) -> dict:
@@ -503,11 +450,11 @@ def detect_objects_and_check_geometry(image: Image.Image) -> dict:
 
     # Kenar parçalarını birbirine yakınsa birleştir (nesnenin dış hattı
     # kesintili çıkabiliyor, bunu kapatıyoruz).
-    closed = _binary_dilate(binary, iterations=3)
-    closed = _binary_erode(closed, iterations=3)
-    closed = _fill_holes(closed)
+    structure = np.ones((3, 3))
+    closed = ndimage.binary_closing(binary, structure=structure, iterations=3)
+    closed = ndimage.binary_fill_holes(closed)
 
-    labeled, num_features = _label_connected_components(closed)
+    labeled, num_features = ndimage.label(closed, structure=structure)
 
     if num_features == 0:
         return {"object_count": 0, "objects": [], "size_warning": None, "shadow_warning": None}
@@ -517,7 +464,7 @@ def detect_objects_and_check_geometry(image: Image.Image) -> dict:
     max_area = (h * w) * 0.5     # görüntünün yarısından büyükse muhtemelen arka plandır, nesne değil
 
     objects = []
-    slices = _find_object_slices(labeled, num_features)
+    slices = ndimage.find_objects(labeled)
     for i, sl in enumerate(slices, start=1):
         if sl is None:
             continue
@@ -556,22 +503,23 @@ def detect_objects_and_check_geometry(image: Image.Image) -> dict:
     # bir yöntemle (örn. ışık kaynağı modelleme) yeniden ele alınabilir.
     shadow_warning = None
 
-    # Görselleştirme
-    annotated = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(annotated)
+    # Görselleştirme (küçük bir gösterim kopyası üzerinde, büyük fotoğraflarda hız için)
     inv_scale = 1.0 / scale if scale < 1.0 else 1.0
-    line_w = max(2, original_size[0] // 300)
+    display, display_scale = _prepare_display_copy(image)
+    draw = ImageDraw.Draw(display)
+    line_w = max(2, display.size[0] // 300)
     for idx, o in enumerate(objects, start=1):
         x0, y0, x1, y1 = o["box"]
-        box_orig = tuple(int(v * inv_scale) for v in (x0, y0, x1, y1))
+        box_orig = tuple(v * inv_scale for v in (x0, y0, x1, y1))
+        box_display = tuple(int(v * display_scale) for v in box_orig)
         color = (250, 204, 21) if idx - 1 not in outlier_indices else (239, 68, 68)
-        draw.rectangle(box_orig, outline=color, width=line_w)
+        draw.rectangle(box_display, outline=color, width=line_w)
 
     return {
         "object_count": len(objects),
         "size_warning": size_warning,
         "shadow_warning": shadow_warning,
-        "annotated_image_base64": image_to_base64(annotated),
+        "annotated_image_base64": image_to_base64(display),
     }
 
 
