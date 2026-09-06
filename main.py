@@ -404,6 +404,94 @@ def detect_copy_move(image: Image.Image, block_size: int = 12, stride: int = 1) 
     }
 
 
+def detect_ai_generated_heuristic(image: Image.Image) -> dict:
+    """
+    Yapay zeka ile üretilmiş olma ihtimaline dair KABA bir istatistiksel
+    tahmin. Bu, eğitilmiş bir yapay zeka modeli DEĞİL — sadece iki basit
+    gözleme dayanıyor:
+
+    1. Gürültü tabanı: Gerçek bir kamera sensörü, görüntünün en "düz"
+       görünen bölgelerinde (gökyüzü, duvar, su yüzeyi vb.) bile hafif bir
+       tane/gürültü (grain) bırakır. Yapay zeka üretimi görseller genelde
+       bu doğal sensör gürültüsünden yoksundur, aşırı "pürüzsüz" görünür.
+    2. Frekans deseni: Bazı üretim modelleri (özellikle upsampling/
+       yükseltme katmanları kullananlar), görüntünün frekans spektrumunda
+       insan gözüyle görünmeyen ama istatistiksel olarak tespit edilebilen
+       düzenli (periyodik) bir iz bırakabilir.
+
+    ÖNEMLİ: Bu yöntem KESİN DEĞİLDİR. Çok düşük ISO ile çekilmiş, aşırı
+    net/temiz fotoğraflar ya da güçlü gürültü azaltma (noise reduction)
+    uygulanmış gerçek fotoğraflar da yanlışlıkla "yapay zeka" gibi
+    görünebilir. Sonuç her zaman bir olasılık/işaret olarak sunulmalı,
+    kesin bir hüküm olarak değil.
+    """
+    gray = image.convert("L")
+    max_dim = 600
+    scale = min(1.0, max_dim / max(gray.size))
+    if scale < 1.0:
+        gray = gray.resize(
+            (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
+            Image.BILINEAR,
+        )
+
+    arr = np.asarray(gray, dtype=np.float32)
+    h, w = arr.shape
+
+    # --- 1. Gürültü tabanı analizi ---
+    block = 8
+    h_trim = (h // block) * block
+    w_trim = (w // block) * block
+    trimmed = arr[:h_trim, :w_trim]
+    blocks = trimmed.reshape(h_trim // block, block, w_trim // block, block)
+    block_stds = blocks.std(axis=(1, 3))
+
+    # En "düz" (en az dokulu) bloklara bakıyoruz — gerçek bir fotoğrafta
+    # bile bunlar tamamen gürültüsüz olmaz.
+    noise_floor = float(np.percentile(block_stds, 15))
+
+    # --- 2. Frekans spektrumu periyodiklik kontrolü ---
+    fft = np.fft.fft2(arr)
+    fft_shifted = np.fft.fftshift(fft)
+    magnitude = np.log1p(np.abs(fft_shifted))
+
+    cy, cx = h // 2, w // 2
+    # Orta frekans halkasındaki enerjinin ne kadar "düzenli/tepeli"
+    # dağıldığına bakıyoruz (doğal görüntülerde spektrum pürüzsüzce
+    # azalır, yapay upsampling izleri belirgin tepecikler bırakabilir).
+    ring_mask = np.zeros_like(magnitude, dtype=bool)
+    yy, xx = np.ogrid[:h, :w]
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    ring_mask = (dist > min(h, w) * 0.2) & (dist < min(h, w) * 0.45)
+    ring_values = magnitude[ring_mask]
+    if len(ring_values) > 0:
+        ring_std = float(ring_values.std())
+        ring_mean = float(ring_values.mean())
+        spectral_peakiness = ring_std / (ring_mean + 1e-6)
+    else:
+        spectral_peakiness = 0.0
+
+    # --- Skor birleştirme ---
+    # Gürültü tabanı çok düşükse (aşırı pürüzsüz) şüphe artar.
+    if noise_floor < 1.0:
+        noise_score = 70
+    elif noise_floor < 2.0:
+        noise_score = 40
+    elif noise_floor < 3.0:
+        noise_score = 15
+    else:
+        noise_score = 0
+
+    spectral_score = min(int(spectral_peakiness * 40), 30)
+
+    ai_score = min(round(noise_score * 0.75 + spectral_score * 0.25), 100)
+
+    return {
+        "ai_likelihood_score": ai_score,
+        "noise_floor": round(noise_floor, 2),
+        "reliability": "düşük",
+    }
+
+
 def detect_objects_and_check_geometry(image: Image.Image) -> dict:
     """
     Hafif (YOLO gerektirmeyen) nesne sayımı + tutarlılık kontrolü.
@@ -554,8 +642,9 @@ async def analyze_image(file: UploadFile = File(...)):
     screenshot_check = detect_screenshot(image, file.filename, exif_data)
     copy_move_result = detect_copy_move(image)
     geometry_result = detect_objects_and_check_geometry(image)
+    ai_generated_result = detect_ai_generated_heuristic(image)
 
-    # Genel şüphe skoru: metadata + ELA + copy-move + geometri sinyalleri.
+    # Genel şüphe skoru: metadata + ELA + copy-move + geometri + AI sinyalleri.
     copy_move_score = 70 if copy_move_result.get("detected") else 0
     geometry_score = 0
     if geometry_result.get("size_warning"):
@@ -564,16 +653,18 @@ async def analyze_image(file: UploadFile = File(...)):
         geometry_score += 25
 
     weights = {
-        "metadata": 0.2,
-        "ela": 0.3,
-        "copy_move": 0.35,
-        "geometry": 0.15,
+        "metadata": 0.15,
+        "ela": 0.25,
+        "copy_move": 0.3,
+        "geometry": 0.1,
+        "ai_generated": 0.2,
     }
     raw_scores = {
         "metadata": metadata_analysis["suspicion_score"],
         "ela": ela_stats["ela_score"],
         "copy_move": copy_move_score,
         "geometry": geometry_score,
+        "ai_generated": ai_generated_result["ai_likelihood_score"],
     }
     overall_score = round(sum(raw_scores[k] * weights[k] for k in weights))
 
@@ -601,6 +692,12 @@ async def analyze_image(file: UploadFile = File(...)):
             "raw_score": raw_scores["geometry"],
             "weight_pct": int(weights["geometry"] * 100),
             "contribution": round(raw_scores["geometry"] * weights["geometry"], 1),
+        },
+        {
+            "label": "AI-generated ihtimali (deneysel)",
+            "raw_score": raw_scores["ai_generated"],
+            "weight_pct": int(weights["ai_generated"] * 100),
+            "contribution": round(raw_scores["ai_generated"] * weights["ai_generated"], 1),
         },
     ]
 
@@ -631,6 +728,7 @@ async def analyze_image(file: UploadFile = File(...)):
         },
         "copy_move_analysis": copy_move_result,
         "geometry_analysis": geometry_result,
+        "ai_generated_analysis": ai_generated_result,
         "screenshot_check": screenshot_check,
         "signal_breakdown": signal_breakdown,
         "verdict": verdict,
@@ -848,6 +946,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .section.cat-ela { --cat-color: var(--cyan); }
   .section.cat-copymove { --cat-color: #f472b6; }
   .section.cat-geometry { --cat-color: #a78bfa; }
+  .section.cat-ai { --cat-color: #34d399; }
 
   .section h3 {
     margin: 0 0 12px;
@@ -955,6 +1054,12 @@ HTML_PAGE = """<!DOCTYPE html>
       <p class="section-desc" id="geometryCount"></p>
       <img id="geometryImage" class="section-img" alt="Nesne tespiti görseli">
       <div id="geometryWarnings"></div>
+    </div>
+
+    <div class="section cat-ai">
+      <h3>AI-generated ihtimali <span style="font-weight:400; color:var(--muted); font-size:0.78rem;">(deneysel)</span></h3>
+      <p class="section-desc">Bu, eğitilmiş bir yapay zeka modeli değil — sadece görüntünün gürültü/doku istatistiklerine bakan kaba bir tahmin. Güvenilirliği düşüktür, kesin kanıt olarak kullanılmamalıdır.</p>
+      <div id="aiGeneratedStats"></div>
     </div>
 
     <div class="section cat-meta">
@@ -1098,6 +1203,9 @@ function renderReport(data) {
     if (data.geometry_analysis.size_warning) allFlags.push(data.geometry_analysis.size_warning);
     if (data.geometry_analysis.shadow_warning) allFlags.push(data.geometry_analysis.shadow_warning);
   }
+  if (data.ai_generated_analysis && data.ai_generated_analysis.ai_likelihood_score >= 40) {
+    allFlags.push(`Görsel, yapay zeka üretimi görsellerde sık görülen aşırı "pürüzsüz" bir doku sergiliyor (skor: ${data.ai_generated_analysis.ai_likelihood_score}/100). Bu deneysel bir sinyaldir, kesin kanıt değildir.`);
+  }
   if (allFlags.length === 0) {
     const d = document.createElement("div");
     d.className = "flag clean";
@@ -1157,6 +1265,22 @@ function renderReport(data) {
     });
   } else {
     geoSection.style.display = "none";
+  }
+
+  const ai = data.ai_generated_analysis;
+  if (ai) {
+    const aiStats = document.getElementById("aiGeneratedStats");
+    aiStats.innerHTML = "";
+    [
+      ["AI-generated skoru", ai.ai_likelihood_score + " / 100"],
+      ["Gürültü tabanı", ai.noise_floor],
+      ["Güvenilirlik", ai.reliability],
+    ].forEach(([label, val]) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<span>${label}</span><span>${val}</span>`;
+      aiStats.appendChild(row);
+    });
   }
 
   const fileInfo = document.getElementById("fileInfo");
